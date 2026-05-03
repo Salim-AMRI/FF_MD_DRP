@@ -1,0 +1,710 @@
+import gurobipy as gp
+from gurobipy import GRB
+import numpy as np
+import pandas as pd
+import json
+import time
+import os
+
+# ============================================================
+# 📘 CLASSE INSTANCELOADER
+# ============================================================
+
+class InstanceLoader:
+    """Classe identique à celle utilisée dans BCO."""
+    def __init__(self, instance_id):
+        base_path = "./medium_instances/"
+        self.csv_path = f"{base_path}medium_instance_{instance_id}.csv"
+        self.json_path = f"{base_path}medium_instance_{instance_id}.json"
+
+        if not os.path.exists(self.csv_path):
+            raise FileNotFoundError(f"❌ CSV file not found at {self.csv_path}")
+        if not os.path.exists(self.json_path):
+            raise FileNotFoundError(f"❌ JSON file not found at {self.json_path}")
+
+        self.data = pd.read_csv(self.csv_path)
+        with open(self.json_path, "r") as f:
+            self.meta = json.load(f)
+
+        self.num_depots = self.meta["num_depots"]
+        self.num_drones = self.meta["num_drones"]
+        self.num_targets = self.meta["num_targets"]
+        self.distance_matrix = np.array(self.meta["distance_matrix"])
+        self.depots = [(d["lat"], d["lon"]) for d in self.meta["depots"]]
+        self.targets = list(zip(self.data["Latitude"], self.data["Longitude"]))
+        self.risks = list(self.data["DMRIF_Score"])
+        self.max_flight_time = self.meta["max_flight_time"]
+        self.cruise_speed = self.meta["cruise_speed"]
+        self.processing_time = self.meta["processing_time"]
+        self.battery_capacity = self.meta.get("battery_capacity", 20000)
+        self.voltage = self.meta.get("voltage", 14.8)
+        self.energy_consumption = self.meta.get("energy_consumption", {
+            "cruising": 120, "hovering": 80, "processing": 40
+        })
+
+    def summary(self):
+        """Affiche un résumé."""
+        print(f"📂 Instance summary:")
+        print(f"  Depots: {self.num_depots}, Drones: {self.num_drones}, Targets: {self.num_targets}")
+        print(f"  Max flight time: {self.max_flight_time}min, Speed: {self.cruise_speed}km/h")
+        print(f"  Battery: {self.battery_capacity}mAh, Voltage: {self.voltage}V")
+        print(f"  Distance matrix size: {self.distance_matrix.shape}")
+        print(f"  Total risk score: {sum(self.risks)}")
+
+# ============================================================
+# 🧠 MODÈLE GUROBI COMPLETEMENT CORRIGÉ
+# ============================================================
+
+def solve_uav_vrp_gurobi_exact(instance, time_limit=300, mip_gap=0.01, verbose=True):
+    """
+    Solveur Gurobi STRICTEMENT ÉQUIVALENT à BCO
+    ✅ Toutes les erreurs corrigées
+    ✅ Syntaxe Gurobi valide
+    """
+
+    if verbose:
+        print(f"\n{'='*80}")
+        print("🧠 GUROBI EXACT SOLVER - MODÈLE CORRIGÉ (ÉQUIVALENT BCO)")
+        print(f"{'='*80}")
+
+    # ============================================================
+    # PARAMÈTRES IDENTIQUES À BCO
+    # ============================================================
+
+    N_DEPOTS = instance.num_depots
+    N_TARGETS = instance.num_targets
+    N_DRONES = instance.num_drones
+
+    DEPOTS = list(range(N_DEPOTS))
+    TARGETS = list(range(N_DEPOTS, N_DEPOTS + N_TARGETS))
+    NODES = DEPOTS + TARGETS
+    DRONES = list(range(N_DRONES))
+
+    dist = instance.distance_matrix
+    risks = instance.risks
+    max_risk_total = sum(risks)
+
+    # Capacités
+    SPEED = instance.cruise_speed
+    MAX_FLIGHT_TIME = instance.max_flight_time
+
+    # Énergie (même calcul que BCO)
+    BATTERY_CAPACITY_WH = (instance.battery_capacity * instance.voltage) / 1000
+    ENERGY_PER_KM = instance.energy_consumption["cruising"] / SPEED if SPEED > 0 else float('inf')
+
+    # ============================================================
+    # 🎯 POIDS IDENTIQUES À BCO
+    # ============================================================
+
+    WEIGHTS = {
+        'distance': 1.0,        # w_D
+        'unvisited': 1000.0,    # w_U
+        'risk': 200.0,          # w_R
+        'low_battery': 100.0,   # w_B
+        'workload': 10.0        # w_L
+    }
+
+    # ============================================================
+    # MODÈLE GUROBI
+    # ============================================================
+
+    model = gp.Model("MDVRP_UAV_Exact_Corrected")
+    model.setParam("OutputFlag", verbose)
+    model.setParam("TimeLimit", time_limit)
+    model.setParam("MIPGap", mip_gap)
+    model.setParam("Threads", 2)
+
+    if verbose:
+        print("📊 Création des variables...")
+
+    # ============================================================
+    # VARIABLES CORRECTES
+    # ============================================================
+
+    # Variables de routage
+    x = {}
+    for d in DRONES:
+        for i in NODES:
+            for j in NODES:
+                if i != j:
+                    x[d,i,j] = model.addVar(
+                        vtype=GRB.BINARY,
+                        name=f"x_{d}_{i}_{j}"
+                    )
+
+    # Variables de visite
+    y = {}
+    for i in TARGETS:
+        y[i] = model.addVar(vtype=GRB.BINARY, name=f"y_{i}")
+
+    # ✅ Variable drone utilisé
+    z = {}
+    for d in DRONES:
+        z[d] = model.addVar(vtype=GRB.BINARY, name=f"z_{d}")
+
+    # Variables pour MTZ
+    u = {}
+    for d in DRONES:
+        for i in TARGETS:
+            u[d,i] = model.addVar(
+                vtype=GRB.CONTINUOUS,
+                lb=0,
+                ub=N_TARGETS-1,
+                name=f"u_{d}_{i}"
+            )
+
+    # Variables pour batterie faible (simplifiées)
+    low_battery = {}
+    for d in DRONES:
+        low_battery[d] = model.addVar(vtype=GRB.BINARY, name=f"low_{d}")
+
+    # Variables pour nombre de cibles par drone
+    targets_per_drone = {}
+    for d in DRONES:
+        targets_per_drone[d] = model.addVar(
+            vtype=GRB.CONTINUOUS,
+            lb=0,
+            ub=N_TARGETS,
+            name=f"ntargets_{d}"
+        )
+
+    model.update()
+
+    # ============================================================
+    # OBJECTIF IDENTIQUE À BCO
+    # ============================================================
+
+    if verbose:
+        print("🎯 Définition de l'objectif...")
+
+    # 1. Terme distance
+    total_distance = gp.quicksum(
+        dist[i][j] * x[d,i,j]
+        for d in DRONES
+        for i in NODES
+        for j in NODES if i != j
+    )
+
+    # 2. Terme cibles non visitées
+    unvisited_penalty = gp.quicksum(1 - y[i] for i in TARGETS)
+
+    # 3. Terme risque (comme BCO corrigé)
+    risk_covered = gp.quicksum(risks[i - N_DEPOTS] * y[i] for i in TARGETS)
+    risk_penalty = 1 - (risk_covered / max_risk_total if max_risk_total > 0 else 0)
+
+    # 4. Terme batterie faible (via variable binaire)
+    low_battery_penalty = gp.quicksum(low_battery[d] for d in DRONES)
+
+    # 5. Terme équilibrage charge
+    # D'abord calculer le nombre de cibles par drone
+    for d in DRONES:
+        model.addConstr(
+            targets_per_drone[d] == gp.quicksum(
+                x[d,i,j] for i in TARGETS for j in NODES if i != j
+            ),
+            name=f"calc_targets_{d}"
+        )
+
+    # Variables pour écart absolu
+    abs_dev = {}
+    for d in DRONES:
+        abs_dev[d] = model.addVar(vtype=GRB.CONTINUOUS, lb=0, name=f"absdev_{d}")
+
+    # Calcul de la moyenne
+    total_targets_visited = gp.quicksum(targets_per_drone[d] for d in DRONES)
+
+    # Contraintes pour valeur absolue
+    for d in DRONES:
+        # abs_dev[d] >= targets_per_drone[d] - avg_targets
+        # abs_dev[d] >= avg_targets - targets_per_drone[d]
+        # On approxime avg_targets = total_targets_visited / N_DRONES
+        # On multiplie par N_DRONES pour éviter la division
+        model.addConstr(
+            N_DRONES * abs_dev[d] >= targets_per_drone[d] * N_DRONES - total_targets_visited,
+            name=f"abs1_{d}"
+        )
+        model.addConstr(
+            N_DRONES * abs_dev[d] >= total_targets_visited - targets_per_drone[d] * N_DRONES,
+            name=f"abs2_{d}"
+        )
+
+    workload_imbalance = gp.quicksum(abs_dev[d] for d in DRONES) / max(1, N_DRONES)
+
+    # OBJECTIF COMPLET
+    objective = (
+        WEIGHTS['distance'] * total_distance +
+        WEIGHTS['unvisited'] * unvisited_penalty +
+        WEIGHTS['risk'] * risk_penalty +
+        WEIGHTS['low_battery'] * low_battery_penalty +
+        WEIGHTS['workload'] * workload_imbalance
+    )
+
+    model.setObjective(objective, GRB.MINIMIZE)
+
+    # ============================================================
+    # CONTRAINTES CORRIGÉES
+    # ============================================================
+
+    if verbose:
+        print("🔧 Ajout des contraintes...")
+
+    # ============================================================
+    # ✅ CORRECTION 1: VARIABLE DRONE UTILISÉ
+    # ============================================================
+
+    for d in DRONES:
+        # z[d] = 1 ssi drone d visite ≥1 cible
+        # Contrainte inférieure
+        model.addConstr(
+            gp.quicksum(x[d,i,j] for i in TARGETS for j in NODES if i != j) >= z[d],
+            name=f"z_lower_{d}"
+        )
+
+        # Contrainte supérieure
+        big_M = N_TARGETS * 2  # Suffisamment grand
+        model.addConstr(
+            gp.quicksum(x[d,i,j] for i in TARGETS for j in NODES if i != j) <= big_M * z[d],
+            name=f"z_upper_{d}"
+        )
+
+        # Départ EXACTEMENT 1 si utilisé
+        model.addConstr(
+            gp.quicksum(x[d,depot,j] for depot in DEPOTS for j in TARGETS) == z[d],
+            name=f"depart_{d}"
+        )
+
+        # Retour EXACTEMENT 1 si utilisé
+        model.addConstr(
+            gp.quicksum(x[d,i,depot] for i in TARGETS for depot in DEPOTS) == z[d],
+            name=f"return_{d}"
+        )
+
+    # ============================================================
+    # ✅ CORRECTION 2: FLUX UNIQUEMENT SUR CIBLES
+    # ============================================================
+
+    for d in DRONES:
+        for i in TARGETS:
+            inflow = gp.quicksum(x[d,j,i] for j in NODES if j != i)
+            outflow = gp.quicksum(x[d,i,j] for j in NODES if j != i)
+            model.addConstr(inflow == outflow, name=f"flow_{d}_{i}")
+
+    # ============================================================
+    # CONTRAINTES DE BASE
+    # ============================================================
+
+    # 1. Chaque cible visitée au plus une fois
+    for i in TARGETS:
+        model.addConstr(
+            gp.quicksum(x[d,i,j] for d in DRONES for j in NODES if i != j) == y[i],
+            name=f"visit_{i}"
+        )
+
+    # 2. Élimination des sous-tours (MTZ)
+    for d in DRONES:
+        for i in TARGETS:
+            for j in TARGETS:
+                if i != j:
+                    model.addConstr(
+                        u[d,i] - u[d,j] + N_TARGETS * x[d,i,j] <= N_TARGETS - 1,
+                        name=f"subtour_{d}_{i}_{j}"
+                    )
+
+    # ============================================================
+    # ✅ CORRECTION 3: CONTRAINTES RESSOURCES SIMPLIFIÉES
+    # ============================================================
+
+    # Portée maximale (aller-retour avec marge)
+    max_range_energy = BATTERY_CAPACITY_WH / ENERGY_PER_KM if ENERGY_PER_KM > 0 else float('inf')
+    max_range_time = (MAX_FLIGHT_TIME / 60) * SPEED
+    max_range = min(max_range_energy, max_range_time)
+
+    # Variables pour distance par drone
+    distance_per_drone = {}
+    for d in DRONES:
+        distance_per_drone[d] = model.addVar(
+            vtype=GRB.CONTINUOUS,
+            lb=0,
+            name=f"dist_{d}"
+        )
+
+    # Calcul de la distance par drone
+    for d in DRONES:
+        model.addConstr(
+            distance_per_drone[d] == gp.quicksum(
+                dist[i][j] * x[d,i,j] for i in NODES for j in NODES if i != j
+            ),
+            name=f"calc_dist_{d}"
+        )
+
+    # Contrainte de portée
+    for d in DRONES:
+        model.addConstr(
+            distance_per_drone[d] <= max_range * 1.1,  # 10% de marge
+            name=f"max_range_{d}"
+        )
+
+    # Batterie faible si distance > 90% de la portée max
+    for d in DRONES:
+        model.addConstr(
+            distance_per_drone[d] >= 0.9 * max_range * low_battery[d],
+            name=f"low_battery_trig_{d}"
+        )
+        model.addConstr(
+            distance_per_drone[d] <= max_range * (1 - low_battery[d]) + 0.9 * max_range * low_battery[d],
+            name=f"low_battery_bound_{d}"
+        )
+
+    # ============================================================
+    # CONTRAINTE: AU MOINS UNE CIBLE VISITÉE
+    # ============================================================
+
+    if N_TARGETS > 0:
+        # Vérifier si c'est faisable
+        min_distance = min(dist[depot][target]
+                          for depot in DEPOTS
+                          for target in TARGETS)
+
+        if min_distance * 2 <= max_range * 1.1:  # Aller-retour avec marge
+            model.addConstr(
+                gp.quicksum(y[i] for i in TARGETS) >= 1,
+                name="at_least_one_target"
+            )
+
+    model.update()
+
+    # ============================================================
+    # OPTIMISATION
+    # ============================================================
+
+    if verbose:
+        print(f"\n⚡ DÉBUT OPTIMISATION")
+        print(f"   Variables: {model.NumVars:,}")
+        print(f"   Contraintes: {model.NumConstrs:,}")
+
+    start_time = time.time()
+    model.optimize()
+    solve_time = time.time() - start_time
+
+    # ============================================================
+    # ANALYSE DES RÉSULTATS
+    # ============================================================
+
+    if verbose:
+        print(f"\n📊 STATUT: {get_status_name(model.Status)}")
+        print(f"   Temps: {solve_time:.2f}s")
+
+    if model.Status == GRB.INFEASIBLE:
+        if verbose:
+            print("❌ MODÈLE INFAISABLE")
+            try:
+                model.computeIIS()
+                model.write("model_iis.ilp")
+                print("   Fichier IIS généré: model_iis.ilp")
+            except:
+                pass
+        return None
+
+    elif model.Status in [GRB.OPTIMAL, GRB.TIME_LIMIT, GRB.SUBOPTIMAL]:
+
+        if verbose:
+            print(f"✅ SOLUTION TROUVÉE")
+            print(f"   Coût objectif: {model.ObjVal:.2f}")
+            if hasattr(model, 'MIPGap'):
+                print(f"   Gap: {model.MIPGap*100:.2f}%")
+
+        # ======================================================
+        # EXTRACTION DE LA SOLUTION
+        # ======================================================
+
+        solution = extract_solution(
+            model, x, y, z, distance_per_drone, low_battery,
+            DRONES, DEPOTS, TARGETS, NODES,
+            dist, risks, N_DEPOTS, N_TARGETS, WEIGHTS, max_range
+        )
+
+        if solution is None:
+            return None
+
+        # Ajouter métadonnées
+        solution.update({
+            'status': model.Status,
+            'status_name': get_status_name(model.Status),
+            'objective_value': model.ObjVal,
+            'solve_time': solve_time,
+            'mip_gap': model.MIPGap if hasattr(model, 'MIPGap') else 0,
+            'model_vars': model.NumVars,
+            'model_constrs': model.NumConstrs,
+        })
+
+        # Afficher résultats
+        if verbose:
+            display_solution(solution)
+
+        return solution
+
+    else:
+        if verbose:
+            print(f"❌ ÉCHEC OPTIMISATION - Statut: {model.Status}")
+        return None
+
+# ============================================================
+# FONCTIONS UTILITAIRES
+# ============================================================
+
+def extract_solution(model, x, y, z, distance_per_drone, low_battery,
+                    DRONES, DEPOTS, TARGETS, NODES,
+                    dist, risks, N_DEPOTS, N_TARGETS, WEIGHTS, max_range):
+    """Extrait la solution du modèle."""
+
+    if model.SolCount == 0:
+        return None
+
+    routes = {}
+    visited_targets = []
+    total_distance = 0
+    drones_used = 0
+
+    for d in DRONES:
+        routes[d] = []
+
+        # Vérifier si le drone est utilisé
+        if z[d].X > 0.5:
+            drones_used += 1
+
+            # Trouver le départ
+            start_depot = None
+            for depot in DEPOTS:
+                for j in TARGETS:
+                    if x[d,depot,j].X > 0.5:
+                        start_depot = depot
+                        routes[d].append(depot)
+                        break
+                if start_depot is not None:
+                    break
+
+            # Suivre le chemin
+            if start_depot is not None:
+                current = start_depot
+                visited = set([current])
+
+                while True:
+                    next_node = None
+                    for j in NODES:
+                        if j != current and x[d,current,j].X > 0.5 and j not in visited:
+                            next_node = j
+                            break
+
+                    if next_node is None:
+                        break
+
+                    routes[d].append(next_node)
+                    if hasattr(dist, '__getitem__'):
+                        total_distance += dist[current][next_node]
+                    current = next_node
+                    visited.add(current)
+
+                    if current in TARGETS and current not in visited_targets:
+                        visited_targets.append(current)
+
+    # Vérifier aussi via variables y[i]
+    visited_count = sum(1 for i in TARGETS if y[i].X > 0.5)
+    visited_targets = [i for i in TARGETS if y[i].X > 0.5]
+
+    # Calculer les métriques
+    total_risk = sum(risks[t - N_DEPOTS] for t in visited_targets)
+    max_risk_total = sum(risks)
+    risk_coverage_ratio = total_risk / max_risk_total if max_risk_total > 0 else 0
+
+    # Calcul distance totale
+    total_distance = 0
+    for d in DRONES:
+        if hasattr(distance_per_drone[d], 'X'):
+            total_distance += distance_per_drone[d].X
+
+    # Calculer le coût
+    unvisited_penalty = WEIGHTS['unvisited'] * (N_TARGETS - visited_count)
+    distance_term = WEIGHTS['distance'] * total_distance
+    risk_penalty = WEIGHTS['risk'] * (1 - risk_coverage_ratio)
+
+    # Batterie faible
+    low_battery_count = sum(1 for d in DRONES if low_battery[d].X > 0.5)
+    low_battery_penalty = WEIGHTS['low_battery'] * low_battery_count
+
+    # Équilibrage de charge
+    targets_per_drone_list = []
+    for d in DRONES:
+        route = routes.get(d, [])
+        targets_in_route = len([n for n in route if n in TARGETS])
+        targets_per_drone_list.append(targets_in_route)
+
+    if targets_per_drone_list and len(targets_per_drone_list) > 0:
+        avg_targets = sum(targets_per_drone_list) / len(targets_per_drone_list)
+        workload_imbalance = sum(abs(cnt - avg_targets) for cnt in targets_per_drone_list)
+    else:
+        workload_imbalance = 0
+
+    workload_penalty = WEIGHTS['workload'] * workload_imbalance
+
+    total_cost = (distance_term + unvisited_penalty + risk_penalty +
+                  low_battery_penalty + workload_penalty)
+
+    # Solution
+    solution = {
+        'total_distance': total_distance,
+        'visited_targets': visited_count,
+        'total_targets': N_TARGETS,
+        'coverage_ratio': visited_count / N_TARGETS if N_TARGETS > 0 else 0,
+        'total_risk_covered': total_risk,
+        'max_possible_risk': max_risk_total,
+        'risk_coverage_ratio': risk_coverage_ratio,
+        'batteries_low': low_battery_count,
+        'drones_used': drones_used,
+        'workload_imbalance': workload_imbalance,
+        'routes': routes,
+        'cost_components': {
+            'distance_term': distance_term,
+            'unvisited_penalty': unvisited_penalty,
+            'risk_penalty': risk_penalty,
+            'low_battery_penalty': low_battery_penalty,
+            'workload_penalty': workload_penalty,
+            'total_cost': total_cost
+        }
+    }
+
+    return solution
+
+def display_solution(solution):
+    """Affiche la solution."""
+    print(f"\n📊 SOLUTION GUROBI:")
+    print(f"   • Coût objectif: {solution['objective_value']:.2f}")
+    print(f"   • Coût BCO-style: {solution['cost_components']['total_cost']:.2f}")
+    print(f"   • Cibles visitées: {solution['visited_targets']}/{solution['total_targets']} ({solution['coverage_ratio']:.1%})")
+    print(f"   • Distance: {solution['total_distance']:.2f} km")
+    print(f"   • Risque: {solution['total_risk_covered']:.1f}/{solution['max_possible_risk']:.1f}")
+    print(f"   • Drones utilisés: {solution['drones_used']}")
+    print(f"   • Batteries faibles: {solution['batteries_low']}")
+    print(f"   • Temps: {solution['solve_time']:.2f}s")
+
+    if solution['mip_gap'] > 0:
+        print(f"   • Gap: {solution['mip_gap']*100:.2f}%")
+
+    print(f"\n🔍 COMPOSANTS DU COÛT:")
+    comp = solution['cost_components']
+    print(f"   • Distance: {comp['distance_term']:.1f}")
+    print(f"   • Non-visités: {comp['unvisited_penalty']:.1f}")
+    print(f"   • Pénalité risque: {comp['risk_penalty']:.1f}")
+    print(f"   • Batterie faible: {comp['low_battery_penalty']:.1f}")
+    print(f"   • Déséquilibre: {comp['workload_penalty']:.1f}")
+    print(f"   • TOTAL: {comp['total_cost']:.1f}")
+
+    print(f"\n🗺️  ROUTES:")
+    routes_displayed = 0
+    for d, route in solution['routes'].items():
+        if len(route) > 0:
+            targets_in_route = len([n for n in route if n >= solution.get('num_depots', 1)])
+            route_str = " → ".join([f"{'D'+str(node) if node < solution.get('num_depots', 1) else 'T'+str(node-solution.get('num_depots', 1))}" for node in route])
+            print(f"   Drone {d}: {targets_in_route} cibles → {route_str}")
+            routes_displayed += 1
+
+    if routes_displayed == 0:
+        print("   Aucun drone utilisé")
+
+def get_status_name(status_code):
+    """Convertit le code statut Gurobi."""
+    status_map = {
+        GRB.LOADED: 'CHARGÉ',
+        GRB.OPTIMAL: 'OPTIMAL',
+        GRB.INFEASIBLE: 'INFAISABLE',
+        GRB.INF_OR_UNBD: 'INFAISABLE_OU_NON_BORNÉ',
+        GRB.UNBOUNDED: 'NON_BORNÉ',
+        GRB.ITERATION_LIMIT: 'LIMITE_ITÉRATIONS',
+        GRB.NODE_LIMIT: 'LIMITE_NŒUDS',
+        GRB.TIME_LIMIT: 'LIMITE_TEMPS',
+        GRB.SOLUTION_LIMIT: 'LIMITE_SOLUTIONS',
+        GRB.INTERRUPTED: 'INTERROMPU',
+        GRB.NUMERIC: 'ERREUR_NUMÉRIQUE',
+        GRB.SUBOPTIMAL: 'SOUS-OPTIMAL',
+        GRB.INPROGRESS: 'EN_COURS'
+    }
+    return status_map.get(status_code, f'INCONNU_{status_code}')
+
+# ============================================================
+# PROGRAMME PRINCIPAL
+# ============================================================
+
+def main():
+    """Programme principal."""
+    print("="*80)
+    print("🧠 GUROBI SOLVER - VERSION FINALE CORRIGÉE")
+    print("="*80)
+    print("\n✅ CORRECTIONS:")
+    print("   1. ✅ Variable z[d] pour drone utilisé")
+    print("   2. ✅ Flux uniquement sur cibles")
+    print("   3. ✅ Syntaxe Gurobi valide")
+    print("   4. ✅ Objectif identique à BCO")
+    print("="*80)
+
+    instance_id = "4"
+    time_limit = 180
+
+    try:
+        # Charger l'instance
+        print(f"\n📥 CHARGEMENT INSTANCE {instance_id}...")
+        instance = InstanceLoader(instance_id)
+        instance.summary()
+
+        # Vérifications
+        print(f"\n🔍 VÉRIFICATIONS:")
+        max_range_energy = (instance.battery_capacity * instance.voltage / 1000) / (instance.energy_consumption["cruising"] / instance.cruise_speed)
+        max_range_time = (instance.max_flight_time / 60) * instance.cruise_speed
+        max_range = min(max_range_energy, max_range_time)
+        print(f"   • Portée max: {max_range:.1f} km")
+
+        # Résolution
+        print(f"\n⚡ RÉSOLUTION AVEC GUROBI...")
+        solution = solve_uav_vrp_gurobi_exact(
+            instance,
+            time_limit=time_limit,
+            mip_gap=0.01,
+            verbose=True
+        )
+
+        if solution is None:
+            print("\n❌ PAS DE SOLUTION")
+            print("   Vérifier model_iis.ilp pour diagnostic")
+            return
+
+        # Succès
+        print(f"\n{'✅'*20}")
+        print("SUCCÈS!")
+        print(f"{'✅'*20}")
+
+        if solution['status'] == GRB.OPTIMAL:
+            print(f"🎯 Solution OPTIMALE prouvée!")
+        elif solution['mip_gap'] < 0.01:
+            print(f"📈 Solution de haute qualité (gap: {solution['mip_gap']*100:.2f}%)")
+        else:
+            print(f"📊 Solution trouvée (gap: {solution['mip_gap']*100:.2f}%)")
+
+        print(f"\n📊 RÉSULTATS:")
+        print(f"   • Coût: {solution['cost_components']['total_cost']:.2f}")
+        print(f"   • Couverture: {solution['coverage_ratio']:.1%}")
+        print(f"   • Distance: {solution['total_distance']:.2f} km")
+        print(f"   • Temps: {solution['solve_time']:.2f}s")
+
+    except Exception as e:
+        print(f"\n❌ ERREUR: {e}")
+        import traceback
+        traceback.print_exc()
+
+    print(f"\n{'='*80}")
+    print("FIN")
+    print(f"{'='*80}")
+
+# ============================================================
+# EXÉCUTION
+# ============================================================
+
+if __name__ == "__main__":
+    main()
