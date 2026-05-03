@@ -1,0 +1,178 @@
+import numpy as np
+import pandas as pd
+import json
+import os
+from math import radians, sin, cos, sqrt, atan2
+import matplotlib.pyplot as plt
+
+# ============================================================
+# 🔧 CONFIGURATION
+# ============================================================
+NUM_INSTANCES = 10
+BASE_PATH = "./medium_instances/"
+os.makedirs(BASE_PATH, exist_ok=True)
+
+CENTER_LAT, CENTER_LON = 36.75, 8.70
+
+# ============================================================
+# 🧮 FONCTIONS UTILITAIRES
+# ============================================================
+
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    dlon = radians(lon2 - lon1)
+    dlat = radians(lat2 - lat1)
+    a = sin(dlat / 2)*2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2)*2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    return R * c
+
+def generate_targets(num_targets, center_lat, center_lon, delta_km=25):
+    targets = []
+    for i in range(num_targets):
+        d_lat = np.random.uniform(-delta_km / 110.574, delta_km / 110.574)
+        d_lon = np.random.uniform(-delta_km / (111.320 * np.cos(np.radians(center_lat))),
+                                  delta_km / (111.320 * np.cos(np.radians(center_lat))))
+        targets.append((center_lat + d_lat, center_lon + d_lon))
+    return targets
+
+def generate_distance_matrix(points):
+    n = len(points)
+    dist_matrix = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = haversine(points[i][0], points[i][1], points[j][0], points[j][1])
+            dist_matrix[i, j] = dist_matrix[j, i] = d
+    return dist_matrix
+
+# ============================================================
+# 🎨 VISUALISATION
+# ============================================================
+
+def plot_instance(depots, targets, dmrifs, instance_id, size_category):
+    plt.figure(figsize=(6, 5))
+    plt.title(f"{size_category.capitalize()} Instance {instance_id}", fontsize=12, pad=10)
+
+    scatter = plt.scatter(
+        [lon for _, lon in targets],
+        [lat for lat, _ in targets],
+        c=dmrifs,
+        cmap="Reds",
+        s=40,
+        edgecolor='black',
+        label="Critical Points"
+    )
+
+    plt.scatter(
+        [lon for _, lon in depots],
+        [lat for lat, _ in depots],
+        c="green",
+        marker="s",
+        s=80,
+        label="Depots"
+    )
+
+    plt.xlabel("Longitude")
+    plt.ylabel("Latitude")
+    plt.legend()
+    plt.colorbar(scatter, label="DMRIF Score")
+    plt.grid(True, linestyle="--", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f"{BASE_PATH}/instance_{instance_id}_{size_category}_map.png", dpi=200)
+    plt.close()
+
+# ============================================================
+# 🧠 CONFIGURATION DES INSTANCES
+# ============================================================
+
+difficulty_levels = ["easy", "medium", "hard", "very_hard"]
+difficulty_configs = {
+    "easy":   {"drones": (2, 3), "targets": (10, 15), "depots": (1, 2)},
+    "medium": {"drones": (4, 6), "targets": (20, 40), "depots": (2, 3)},
+    "hard":   {"drones": (6, 8), "targets": (40, 60), "depots": (3, 4)},
+    "very_hard": {"drones": (8, 12), "targets": (100, 150), "depots": (4, 6)}   # ajout
+}
+
+print("🚀 Starting MEDIUM instance generation...")
+
+for instance_id in range(1, NUM_INSTANCES + 1):
+    # Sélection de la configuration
+    if instance_id == 1:   # première instance = very_hard
+        config = difficulty_configs["very_hard"]
+    else:
+        difficulty = difficulty_levels[(instance_id - 1) % 3]
+        config = difficulty_configs[difficulty]
+
+    num_depots = np.random.randint(config["depots"][0], config["depots"][1] + 1)
+    num_drones = np.random.randint(config["drones"][0], config["drones"][1] + 1)
+    num_targets = np.random.randint(config["targets"][0], config["targets"][1] + 1)
+
+    # Détermination de la catégorie de taille (peut être personnalisée)
+    if num_targets >= 100:
+        size_category = "large"
+    else:
+        size_category = "standard"
+
+    # Paramètres opérationnels (inchangés)
+    max_flight_time = np.random.randint(60, 121)
+    cruise_speed = np.random.randint(54, 65)
+    processing_time = np.random.randint(1, 4)
+    refueling_time = np.random.randint(5, 15)
+
+    # Génération des points
+    depots = generate_targets(num_depots, CENTER_LAT, CENTER_LON, delta_km=3)
+    targets = generate_targets(num_targets, CENTER_LAT, CENTER_LON, delta_km=30)
+
+    all_points = depots + targets
+    distance_matrix = generate_distance_matrix(all_points)
+
+    # Données aléatoires pour les cibles
+    dmrifs = np.random.randint(1, 6, num_targets)
+    temperature = np.random.normal(35, 2, num_targets)
+    humidity = np.random.uniform(25, 55, num_targets)
+    wind_speed = np.random.uniform(0.5, 5, num_targets)
+
+    # Sauvegarde CSV avec suffixe de taille
+    csv_filename = f"instance_{instance_id}_{size_category}.csv"
+    df = pd.DataFrame({
+        "Target_ID": [f"T{i}" for i in range(num_targets)],
+        "Latitude": [t[0] for t in targets],
+        "Longitude": [t[1] for t in targets],
+        "DMRIF_Score": dmrifs,
+        "Temperature": np.round(temperature, 2),
+        "Humidity": np.round(humidity, 2),
+        "Wind_Speed": np.round(wind_speed, 2),
+    })
+    df.to_csv(os.path.join(BASE_PATH, csv_filename), index=False)
+
+    # Sauvegarde JSON avec champ size_category
+    meta = {
+        "instance_id": instance_id,
+        "difficulty": "very_hard" if instance_id == 1 else difficulty,
+        "size_category": size_category,
+        "num_depots": num_depots,
+        "num_drones": num_drones,
+        "num_targets": num_targets,
+        "max_flight_time": max_flight_time,
+        "cruise_speed": cruise_speed,
+        "processing_time": processing_time,
+        "refueling_time": refueling_time,
+        "depots": [{"id": f"D{i}", "lat": depots[i][0], "lon": depots[i][1]}
+                  for i in range(num_depots)],
+        "distance_matrix": np.round(distance_matrix, 3).tolist(),
+        "battery_capacity": 10000,
+        "voltage": 14.8,
+        "energy_consumption": {
+            "cruising": 100,
+            "hovering": 70,
+            "processing": 30
+        }
+    }
+
+    json_filename = f"instance_{instance_id}_{size_category}.json"
+    json_path = os.path.join(BASE_PATH, json_filename)
+    with open(json_path, "w") as f:
+        json.dump(meta, f, indent=4)
+
+    plot_instance(depots, targets, dmrifs, instance_id, size_category)
+
+print("✅ MEDIUM instances generated.")
